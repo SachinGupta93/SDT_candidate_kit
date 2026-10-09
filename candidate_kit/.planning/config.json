@@ -1,0 +1,13 @@
+{
+  "project_name": "HROne Employee Attendance & Analytics API",
+  "created_at": "2026-10-09T19:07:00+05:30",
+  "workflow": {
+    "auto_commit": true,
+    "require_tests": false,
+    "require_review": true,
+    "research_enabled": false,
+    "parallel_execution": true
+  },
+  "model_profile": "thorough",
+  "milestone": "v1.0"
+}
