@@ -1,7 +1,17 @@
-# DECISIONS.md  (about 150-200 words in total - plain language, your own words)
+# DECISIONS.md
 
-1. **Indexes.** Which indexes did you create, and which query or guarantee does each one serve? Which one did you consider and reject?
-2. **Punch-in race.** Two identical punch-in requests arrive at the same instant. Walk through exactly what happens in your code.
-3. **Ties.** Two employees are tied on late minutes at the cutoff of `limit`. What does your leaderboard return, and why?
-4. **Headcount.** How does your department summary make sure employees with zero logs are counted?
-5. **One thing you would change** if this had to serve 100x the data.
+1. **Indexes.** I created five indexes:
+   - `employees.emp_code` (unique): enforces the business uniqueness constraint and supports every employee lookup by `emp_code` (used in punch-in, punch-out, regularization, and analytics joins). Without it, concurrent `POST /employees` with the same `emp_code` could create duplicates.
+   - `attendance_logs.(emp_code, date)` (unique compound): enforces one attendance record per employee per day and prevents duplicate punch-ins even under concurrent requests. Also supports the `PATCH /attendance/{emp_code}/{date}` lookup.
+   - `attendance_logs.(date DESC, emp_code ASC)`: serves `GET /attendance` which sorts by `date DESC, emp_code ASC` with pagination — the index covers the sort and skip/limit.
+   - `attendance_logs.(emp_code, date DESC)`: serves punch-out (find most recent open record for an employee) and `GET /analytics/employees/{emp_code}/monthly` (range query on date within an employee).
+   - `employees.(department, joined_on)`: serves headcount queries for department summary and trend (filtering by department, then by `joined_on <= date`).
+   I considered a multi-key index on `attendance_logs.(date, status, late_minutes)` for analytics but rejected it: the date range already narrows the working set enough, and the extra index keys would bloat write costs without a meaningful read improvement for the aggregation stages that follow the match.
+
+2. **Punch-in race.** The unique compound index on `(emp_code, date)` is the concurrency guard. When two identical punch-in requests arrive simultaneously: both skip any application-level check and go straight to `insert_one`. MongoDB's unique index guarantees exactly one insert succeeds. The second raises `DuplicateKeyError`, which my code catches and returns 409. There is no `find_one`-then-`insert_one` window where both could succeed. This is atomic at the database level.
+
+3. **Ties.** I use standard competition ranking (1, 2, 2, 4). After sorting all employees by `total_late_minutes DESC, emp_code ASC`, I iterate and assign ranks: when the current total equals the previous, the rank stays the same; otherwise it jumps to the current position. The `limit` parameter is applied after ranking: I include every row whose `rank <= limit`. This means if two employees tie at rank 10 (with `limit=10`), both are returned — the response can contain more than `limit` rows. I chose this because the spec explicitly says "return every employee whose rank <= limit" and "the response can therefore contain more than limit rows when employees tie."
+
+4. **Headcount.** I query the `employees` collection directly with `{"joined_on": {"$lte": last_day_of_month}}` and group by department in Python. This guarantees employees with **zero attendance logs** are still counted — they exist in the employees collection regardless of whether they have any attendance records. If I only looked at the attendance_logs collection, I'd miss employees who never punched in. For the trend endpoint, I do the same per-day: count employees with `joined_on <= that_day`.
+
+5. **One thing I would change** at 100× scale: I would pre-compute and cache the analytics. Currently each analytics request runs a query against the full dataset. At 10M records, I would introduce a materialized view pattern — a `department_monthly_stats` collection that is updated incrementally whenever a punch-in, punch-out, or regularization happens (via a change stream or application-level writes). The trend endpoint would read from the pre-computed collection instead of scanning attendance_logs. I'd also add read replicas and shard the attendance_logs collection by `emp_code` to distribute the load.
