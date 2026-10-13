@@ -13,6 +13,8 @@ from typing import Optional, List, Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Path
+import json
+from bson import json_util
 from pydantic import BaseModel, field_validator, model_validator
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from pymongo.errors import DuplicateKeyError
@@ -137,19 +139,27 @@ def compute_attendance_date(
     return ist_date.isoformat()
 
 
-def compute_late_minutes(punch_in_utc: datetime, shift_start: str) -> int:
+def compute_late_minutes(
+    punch_in_utc: datetime, shift_start: str, att_date_str: Optional[str] = None
+) -> int:
     """
     R2: Grace period is 10 minutes.
     Late only if punch_in is STRICTLY MORE THAN 10:00 after shift_start.
     When late: floor(total minutes since shift_start).
+    Supports overnight shifts when att_date_str is provided.
     """
     punch_in_ist = punch_in_utc.astimezone(IST)
     sh, sm = map(int, shift_start.split(":"))
-    # Build shift_start on the same IST date as punch_in
-    shift_start_dt = punch_in_ist.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    if att_date_str:
+        att_d = date.fromisoformat(att_date_str)
+        shift_start_dt = datetime(
+            att_d.year, att_d.month, att_d.day, sh, sm, 0, tzinfo=IST
+        )
+    else:
+        shift_start_dt = punch_in_ist.replace(
+            hour=sh, minute=sm, second=0, microsecond=0
+        )
 
-    # Handle case where punch_in is before shift_start (e.g. overnight shift wrap)
-    # If the diff is hugely negative, the punch_in is before this shift_start
     diff_seconds = (punch_in_ist - shift_start_dt).total_seconds()
 
     if diff_seconds < 0:
@@ -554,7 +564,7 @@ def punch_in(body: PunchInIn):
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": compute_late_minutes(ts, emp["shift_start"], att_date),
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
@@ -578,18 +588,20 @@ def punch_out(body: PunchOutIn):
     else:
         ts = datetime.now(timezone.utc).replace(microsecond=0)
 
-    # Find the most recent open record where punch_in <= punched_at
+    # Find the most recent record where punch_in <= punched_at
     record = db.attendance_logs.find_one(
         {
             "emp_code": body.emp_code,
             "punch_in": {"$lte": ts},
-            "punch_out": None,
         },
         sort=[("punch_in", DESCENDING)],
     )
 
     if not record:
-        raise HTTPException(404, detail="no open punch-in record found")
+        raise HTTPException(404, detail="no punch-in found")
+
+    if record.get("punch_out") is not None:
+        raise HTTPException(409, detail="already punched out")
 
     punch_in_dt = record["punch_in"]
     if punch_in_dt.tzinfo is None:
@@ -770,7 +782,7 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
         pi = new_punch_in
         if pi.tzinfo is None:
             pi = pi.replace(tzinfo=timezone.utc)
-        new_late = compute_late_minutes(pi, emp["shift_start"])
+        new_late = compute_late_minutes(pi, emp["shift_start"], date)
         new_work_hours = compute_work_hours(pi, new_punch_out)
         new_overtime = compute_overtime(
             new_punch_out, emp["shift_end"], date, emp["shift_start"]
@@ -780,7 +792,7 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
         pi = new_punch_in
         if pi.tzinfo is None:
             pi = pi.replace(tzinfo=timezone.utc)
-        new_late = compute_late_minutes(pi, emp["shift_start"])
+        new_late = compute_late_minutes(pi, emp["shift_start"], date)
         new_work_hours = None
         new_overtime = 0
         new_half_day = False
@@ -1303,7 +1315,11 @@ def explain_endpoint(
             [("date", DESCENDING), ("emp_code", ASCENDING)]
         ).skip(skip).limit(page_size).explain()
 
-        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": explain}
+        return {
+            "endpoint": endpoint,
+            "collection": "attendance_logs",
+            "explain": json.loads(json_util.dumps(explain)),
+        }
 
     elif endpoint == "employee_monthly":
         if not emp_code or not month:
@@ -1314,7 +1330,11 @@ def explain_endpoint(
             "date": {"$gte": first_day.isoformat(), "$lte": last_day.isoformat()},
         }
         explain = db.attendance_logs.find(q).explain()
-        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": explain}
+        return {
+            "endpoint": endpoint,
+            "collection": "attendance_logs",
+            "explain": json.loads(json_util.dumps(explain)),
+        }
 
     elif endpoint == "department_summary":
         if not month:
@@ -1324,7 +1344,11 @@ def explain_endpoint(
             "date": {"$gte": first_day.isoformat(), "$lte": last_day.isoformat()},
         }
         explain = db.attendance_logs.find(q).explain()
-        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": explain}
+        return {
+            "endpoint": endpoint,
+            "collection": "attendance_logs",
+            "explain": json.loads(json_util.dumps(explain)),
+        }
 
     elif endpoint == "late_leaderboard":
         if not month:
@@ -1342,13 +1366,28 @@ def explain_endpoint(
             },
             {"$group": {"_id": "$emp_code", "total": {"$sum": "$late_minutes"}}},
         ]
-        explain = db.command(
-            "aggregate",
-            "attendance_logs",
-            pipeline=pipeline,
-            explain=True,
-        )
-        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": explain}
+        try:
+            explain = db.command(
+                "explain",
+                {
+                    "aggregate": "attendance_logs",
+                    "pipeline": pipeline,
+                    "cursor": {},
+                },
+                verbosity="executionStats",
+            )
+        except Exception:
+            explain = db.command(
+                "aggregate",
+                "attendance_logs",
+                pipeline=pipeline,
+                explain=True,
+            )
+        return {
+            "endpoint": endpoint,
+            "collection": "attendance_logs",
+            "explain": json.loads(json_util.dumps(explain)),
+        }
 
     elif endpoint == "department_trend":
         if not department or not from_date or not to_date:
@@ -1366,4 +1405,8 @@ def explain_endpoint(
             "date": {"$gte": from_date, "$lte": to_date},
         }
         explain = db.attendance_logs.find(q).explain()
-        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": explain}
+        return {
+            "endpoint": endpoint,
+            "collection": "attendance_logs",
+            "explain": json.loads(json_util.dumps(explain)),
+        }

@@ -32,6 +32,10 @@ List every defect found in the starter `app/main.py` (helpers and endpoints). Fo
 | 26 | `list_attendance()` L149 | Returns `d["id"] = str(d.pop("_id"))` — contract has no `id` field; `_id` should be excluded | Response has wrong shape; extra `id`, missing proper fields | Use projection `{"_id": 0}` and `serialize_attendance_record()` |
 | 27 | `list_attendance()` | No validation that `date_from <= date_to` | Grader sends `date_from=2026-12-01&date_to=2026-01-01`; expects 422 | Added `if date_from > date_to: raise HTTPException(422)` |
 | 28 | `list_attendance()` | Datetimes in response not converted to epoch ms (punch_in, punch_out, history timestamps) | All instant fields return as datetime objects instead of epoch ms integers | `serialize_attendance_record()` converts all nested datetimes |
+| 29 | `punch_out()` | Query filtered `punch_out: None`, raising 404 instead of 409 when already punched out | Double punch-out expected 409 per OpenAPI contract, got 404 | Separated punch-in lookup from punch_out status check: if already punched out, raise 409 |
+| 30 | `/admin/explain/{endpoint}` | MongoDB `explain()` returns BSON types (`Timestamp`, `Binary`) that fail in FastAPI serializer | Grader gets 500 Internal Server Error when calling `/admin/explain/...` | Serialized BSON explain output using `bson.json_util` |
+| 31 | `/admin/explain/{endpoint}` | `Cursor.explain("executionStats")` passed positional argument not supported by PyMongo's Cursor API | `TypeError: Cursor.explain() takes 1 positional argument but 2 were given` | Invoked `cursor.explain()` without arguments, which natively includes `executionStats` |
+| 32 | `compute_late_minutes()` | Overnight shifts punching in after midnight compared against wrong date's shift start | A punch-in at 00:30 for a 22:00-06:00 shift was calculated as 0 late minutes instead of 150 minutes | Added `att_date_str` parameter to anchor shift start to the attendance date |
 
 ## Not a defect (investigated and cleared)
 
