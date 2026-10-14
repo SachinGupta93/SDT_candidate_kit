@@ -60,4 +60,4 @@ See `DECISIONS.md` for index choices, concurrency handling, ranking logic, and s
 
 ## Bug Fixes
 
-See `REVIEW.md` for the full list of 28 defects found and fixed in the starter code.
+See `REVIEW.md` for the full list of 32 defects found and fixed in the starter code.
